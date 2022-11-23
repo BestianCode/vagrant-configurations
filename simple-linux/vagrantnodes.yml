@@ -1,0 +1,20 @@
+---
+# IMPORTANT! Don't use underscore for keys
+plugins: [ vagrant-vbguest, vagrant-timezone, vagrant-reload ]
+nodes:
+  vm-lnx:
+    autostart: true
+    hostname: lnx.local
+    box: geerlingguy/ubuntu2004
+    memory: 2048
+    cpus: 2
+    networks:
+      - private_network:
+          ip: 192.168.1.11
+    synced_folders:
+      - host: .
+        guest: /vagrant
+    provisioners:
+      - shell:
+          path: ./provision.sh
+      - reload: # force reboot vm after provisionin

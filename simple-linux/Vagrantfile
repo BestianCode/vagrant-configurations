@@ -1,0 +1,337 @@
+##################################################
+# see README.md for installation details
+# and vagrantnodes.yml for configuration
+# D.Wolinski <dw@cmsystem.de>
+##################################################
+
+# -*- mode: ruby -*-
+# vi: set ft=ruby :
+
+# This is intended to be a drop-in VAGRANT_FILE, which reads VM configurations
+# from a yaml file (vagrantnodes.yml) in the root directory.
+# It supports vagrant cloud boxes and traditional boxes
+# See the README for more thorough documentation.
+
+# We're going to read from yaml files, so we gots to know how to yaml
+require 'yaml'
+
+# If the external_functions directory exists, then load
+# functions from any ruby files in that directory
+#
+# NOTE: Sometimes we want to do things that are a bit more dynamic than just
+#       setting VAGRANT_FILE properties. This provides the ability to define
+#       this sort of dynamic behavior externally to the VAGRANT_FILE itself
+root_dir = File.dirname(__FILE__)
+external_functions_dir = 'external_functions'
+external_functions_path = "#{root_dir}/#{external_functions_dir}"
+
+if File.exist?( external_functions_path )
+  external_function_files = Dir.glob( "#{external_functions_path}/*.rb")
+  external_function_files && external_function_files.each do |external_function_file|
+    require_relative "#{external_functions_dir}/#{File.basename( external_function_file, '.rb' )}"
+  end
+end
+
+###############################################################################
+# Utility functions
+###############################################################################
+
+class ::Hash
+    def deep_merge(second)
+        merger = proc { |key, v1, v2| Hash === v1 && Hash === v2 ? v1.merge(v2, &merger) : v2 }
+        self.merge(second, &merger)
+    end
+end
+
+# Print an error message and stop execution on handled errors
+def handle_error(error_msg)
+  puts "ERROR: #{error_msg}"
+  exit
+end
+
+# Check the "nodes" element from vagrantnodes.yml for existence and completeness
+def verify_nodes(nodes)
+  # Make sure that at least one node is defined
+  if !nodes || nodes.empty?
+    error_msg = 'No nodes defined in vagrantnodes.yml'
+    handle_error(error_msg)
+  end
+
+  # TODO: Add per-node checks for completeness
+  # Build up one big error message with all failed checks
+end
+
+# Convert the shell provisioner arguments from vagrantnodes.yml
+# into an array for the vagrant shell provisioner
+def shell_provisioner_args(yaml_arguments)
+
+  shell_arguments = Array.new
+
+  # Arguments may or may not be named,
+  # and named arguments may or may not have a value.
+  yaml_arguments.each do |argument|
+    argument.key?('name') && shell_arguments.push(argument['name'])
+    argument.key?('value') && shell_arguments.push(argument['value'])
+  end
+
+  shell_arguments
+end
+
+# convert all keys in the given hash to symbols
+# NOTE: Doesn't work with nested hashes, but I don't need this for those yet
+def keys_to_symbols(hash_in)
+  hash_out = hash_in.inject({}) do |hash_rekeyed, (key, value)|
+    hash_rekeyed[key.to_sym] = value
+    hash_rekeyed
+  end
+
+  hash_out
+end
+
+def install_vagrant_plugins(plugins)
+    if plugins.any?
+        # Check and install required plugins
+        plugins.each do |plugin|
+            unless Vagrant.has_plugin?("#{plugin}")
+                if !  Vagrant::Plugin::Manager.instance.install_plugin plugin
+                    error_msg = "Error: missing plugin. Failed to run 'vagrant plugin install --local #{plugin}'"
+                    handle_error(error_msg)
+                end
+            end
+        end
+    end
+end
+
+###############################################################################
+# VM Configuration functions
+#
+# The functions below read node settings from vagrantnodes.yml and set the
+# properties of a vagrant VM appropriately.
+# They are called from the main vagrant configuration loop.
+###############################################################################
+
+# Configure basic information (box, hostname) for the given node
+# from settings in vagrantnodes.yml
+def configure_basic_info(node, node_details, boxes)
+
+  # set the box name and url (if not a vagrant cloud box)
+  box_name = "#{node_details['box']}"
+  node.vm.box = "#{box_name}"
+  boxes && boxes.key?("#{box_name}") && node.vm.box_url = boxes[box_name]
+
+  # configure basic settings
+  node.vm.hostname = node_details['hostname']
+end
+
+# Configure networks for the given node from settings in vagrantnodes.yml
+def configure_networks(node, node_details)
+  networks = node_details['networks']
+  networks && networks.each do |network|
+    network.each do |network_type, network_params|
+      if network_params
+        network_params = keys_to_symbols(network_params)
+        node.vm.network network_type, network_params
+      else
+        node.vm.network network_type
+      end
+    end
+  end
+end
+
+# Configure synced folders for the given node from settings in vagrantnodes.yml
+def configure_synced_folders(node, node_details)
+  synced_folders = node_details['synced_folders']
+  synced_folders && synced_folders.each do |synced_folder|
+    node.vm.synced_folder synced_folder['host'], synced_folder['guest'], create: synced_folder['create'], owner: synced_folder['owner'], group: synced_folder['group']
+  end
+end
+
+# Configure forwarded ports for the given node from settings defined in vagrantnodes.yml
+def configure_forwarded_ports(node, node_details)
+  forwarded_ports = node_details['forwarded_ports']
+  forwarded_ports && forwarded_ports.each do |forwarded_port|
+    forwarded_port = keys_to_symbols(forwarded_port)
+    node.vm.network 'forwarded_port', forwarded_port
+  end
+end
+
+# Configure provisioner properties for the given node from settings defined in vagrantnodes.yml
+#
+# Each key in vagrantnodes.yml should correspond to a valid vagrant provisioner.
+# Each value should correspond to a valid setting for that provisioner.
+#   (Except for 'arguments', which is an array of arguments to the shell provisioner script.)
+def configure_provisioners(node, node_details)
+  provisioners = node_details['provisioners']
+  provisioners && provisioners.each do |provisioner|
+    provisioner.each do |provisioner_type, provisioner_params|
+      node.vm.provision provisioner_type do |provision|
+        provisioner_params && provisioner_params.each do |key, value|
+          if key == 'arguments'
+            provision.args = shell_provisioner_args(value)
+          else
+            provision.send("#{key}=", value)
+          end
+        end
+      end
+    end
+  end
+end
+
+# Configure provider-specific settings for the given node from settings defined in vagrantnodes.yml
+#
+# Each key in vagrantnodes.yml should correspond to a valid vagrant provider
+# Each value should be a hash of valid settings for that provider
+# NOTE: memory and cpus are common enough settings that I don't treat them as
+#       provider-specific in the .yml files
+def configure_providers(node, node_details, node_name)
+  # General provider-specific settings
+  providers = node_details['providers']
+  providers && providers.each do |provider_type, provider_params|
+    node.vm.provider provider_type do |node_provider|
+       provider_params.each do |key, value|
+         node_provider.send("#{key}=", value)
+       end
+    end
+  end
+
+  # Special case provider-specifc settings
+  node.vm.provider 'virtualbox' do |vb|
+    vb.customize [ 'modifyvm', :id, '--memory', node_details['memory'] ]
+    vb.customize [ 'modifyvm', :id, '--cpus', node_details['cpus'] ]
+    vb.customize [ 'modifyvm', :id, '--name', node_name ]
+    vb.name = node_name
+    if node_details['chipset']
+	    vb.customize [ 'modifyvm', :id, '--chipset', node_details['chipset'] ]
+	end
+  end
+  node.vm.provider 'vmware_fusion' do |vmf|
+    vmf.vmx['memsize'] = node_details['memory']
+    vmf.vmx['numvcpus'] = node_details['cpus']
+  end
+  node.vm.provider 'parallels' do |prl|
+    prl.name = node_name
+    prl.memory = node_details['memory']
+    prl.cpus = node_details['cpus']
+  end
+end
+
+# Call any external functions that are defined in vagrantnodes.yml.
+# NOTE: These functions must be defined in ruby files in the
+#       external_functions folder
+def call_external_functions(node, node_details)
+  external_functions = node_details['external_functions']
+  external_functions && external_functions.each do |external_function|
+    send( external_function, node )
+  end
+end
+
+###############################################################################
+# Initialization
+###############################################################################
+
+# Verify that vagrantnodes.yml exists
+root_dir = File.dirname(__FILE__)
+vagrant_yaml_file = "#{root_dir}/vagrantnodes.yml"
+vagrant_yaml_file_local = "#{root_dir}/vagrantnodes.local.yml"
+error_msg = "#{vagrant_yaml_file} does not exist"
+handle_error(error_msg) unless File.exists?(vagrant_yaml_file)
+
+# Read box and node configs from vagrantnodes.yml
+vagrant_yaml = YAML.load_file(vagrant_yaml_file)
+
+# load local definitions and override defaults
+if(File.exist?(vagrant_yaml_file_local))
+    vagrant_yaml_local = YAML.load_file(vagrant_yaml_file_local)
+    if(vagrant_yaml_local != nil)
+        vagrant_yaml = vagrant_yaml.deep_merge(vagrant_yaml_local)
+    end
+end
+
+
+error_msg = "#{vagrant_yaml_file} exists, but is empty"
+handle_error(error_msg) unless vagrant_yaml
+
+boxes = vagrant_yaml['boxes']
+nodes = vagrant_yaml['nodes']
+plugins = vagrant_yaml['plugins']
+defaults = vagrant_yaml['defaults']
+
+# Verify that node definitions exist and are well-formed
+verify_nodes(nodes)
+
+# Install required vagrant plugins
+install_vagrant_plugins(plugins)
+
+###############################################################################
+# Vagrant configuration loop
+###############################################################################
+
+# VAGRANT_FILE API/syntax version. Don't touch unless you know what you're doing!
+VAGRANT_FILE_API_VERSION = '2'
+
+# Minimum required vagrant version
+VAGRANT_FILE_MIN_VERSION  = "1.8.1"
+VAGRANT_FILE_MAX_VERSION  = "2.3.9"
+
+# Check required vagrant version
+Vagrant.require_version ">= #{VAGRANT_FILE_MIN_VERSION}", "<= #{VAGRANT_FILE_MAX_VERSION}"
+
+# For each node defined in vagrantnodes.yml,
+# set the properties of a vagrant VM by calling the functions defined above.
+Vagrant.configure(VAGRANT_FILE_API_VERSION) do |config|
+
+    if Vagrant.has_plugin?("vagrant-cachier")
+
+        # Configure cached packages to be shared between instances of the same base box.
+        # More info on http://fgrehm.viewdocs.io/vagrant-cachier/usage
+        config.cache.scope = :machine
+        config.cache.auto_detect = true
+
+        # OPTIONAL: If you are using VirtualBox, you might want to use that to enable
+        # NFS for shared folders. This is also very useful for vagrant-libvirt if you
+        # want bi-directional sync
+        #config.cache.synced_folder_opts = {
+
+        #    type: :nfs,
+
+            # The nolock option can be useful for an NFSv3 client that wants to avoid the
+            # NLM sideband protocol. Without this option, apt-get might hang if it tries
+            # to lock files needed for /var/cache/* operations. All of this can be avoided
+            # by using NFSv4 everywhere. Please note that the tcp option is not the default.
+
+        #    mount_options: ['rw', 'vers=3', 'tcp', 'nolock']
+        #}
+        # For more information please check http://docs.vagrantup.com/v2/synced-folders/basic_usage.html
+    end
+
+    # vbguest plugin
+    if Vagrant.has_plugin?("vagrant-vbguest")
+        config.vbguest.auto_update = false
+    end
+
+    if Vagrant.has_plugin?("vagrant-timezone")
+        config.timezone.value = :host
+    end
+
+    config.ssh.shell = "bash -c 'BASH_ENV=/etc/profile exec bash'"
+    config.ssh.forward_agent = true
+
+    # Vagrant 1.8.5 problem, s. https://github.com/mitchellh/vagrant/issues/7610
+    #config.ssh.insert_key = false
+
+    # Define vagrant VMs for each node defined in vagrantnodes.yml
+    nodes.each do |node_name, node_details|
+
+        config.vm.define node_name, autostart: node_details['autostart'] do |node|
+
+            configure_basic_info(node, node_details, boxes)
+            configure_networks(node, node_details)
+            configure_forwarded_ports(node, node_details)
+            configure_provisioners(node, node_details)
+            configure_providers(node, node_details, node_name)
+            configure_synced_folders(node, node_details)
+
+            call_external_functions(node, node_details)
+        end
+    end
+end
